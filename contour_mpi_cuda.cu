@@ -374,19 +374,22 @@ int main(int argc, char* argv[]) {
     // ---------- Threshold to binary ----------
     unsigned char *d_bin;  cudaMalloc(&d_bin, graySize);   // graySize bytes
 
-    const unsigned char TH = 20;  // IMPORTANT: Static threshold
+    const unsigned char TH = 120;  // IMPORTANT: Static threshold
     thresh_cuda<<<grid, block>>>(d_nms, d_bin, width, myHeight, TH);
     cudaDeviceSynchronize();
 
     // cudaMemcpy(rgbf, d_smooth, graySize, cudaMemcpyDeviceToHost); // to output grayscale
-    cudaMemcpy(rgbf, d_bin, graySize, cudaMemcpyDeviceToHost);
+    // Allocate the host-side uchar output buffer:
+    unsigned char *outc = (unsigned char*)malloc(graySize);
+    // Copy directly from device uchar buffer to host uchar buffer:
+    cudaMemcpy(outc, d_bin, graySize, cudaMemcpyDeviceToHost);
 
     // Convert to uchar
-    unsigned char *outc = (unsigned char*)malloc(graySize);
-    for (int i=0; i<width*myHeight; i++) {
-        float v = rgbf[i];
-        outc[i] = (unsigned char)(v<0?0:(v>255?255:v));
-    }
+    // unsigned char *outc = (unsigned char*)malloc(graySize);
+    // for (int i=0; i<width*myHeight; i++) {
+    //     float v = rgbf[i];
+    //     outc[i] = (unsigned char)(v<0?0:(v>255?255:v));
+    // }
 
             // Gather single-channel results back to rank 0
     unsigned char *full = NULL;
