@@ -158,6 +158,110 @@ __global__ void gaussian_smooth_cuda(const float *in, float *out,
     out[y*width + x] = (ks > 0 ? sum/ks : sum);
 }
 
+// Sobel kernel for computing gradients
+__global__ void sobel_cuda(const float *in,   // grayscale input
+    float *gx,         // horizontal gradient
+    float *gy,         // vertical   gradient
+    int   width,
+    int   height)
+{
+int x = blockIdx.x * blockDim.x + threadIdx.x;
+int y = blockIdx.y * blockDim.y + threadIdx.y;
+if (x >= width || y >= height) return;
+
+// 3×3 Sobel coefficients
+const float kx[3][3] = { {-1, 0, 1},
+      {-2, 0, 2},
+      {-1, 0, 1} };
+
+const float ky[3][3] = { { 1,  2,  1},
+      { 0,  0,  0},
+      {-1, -2, -1} };
+
+float sx = 0.f, sy = 0.f;
+
+// Convolve in a 3×3 window (with clamped borders)
+for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx)
+    {
+        int ix = min(max(x + dx, 0), width  - 1);
+        int iy = min(max(y + dy, 0), height - 1);
+        float p  = in[iy * width + ix];
+        sx      += p * kx[dy + 1][dx + 1];
+        sy      += p * ky[dy + 1][dx + 1];
+    }
+
+    int idx   = y * width + x;
+    gx[idx] = sx;
+    gy[idx] = sy;
+}
+
+// Kernel to compute magnitude
+__global__ void mag_cuda(const float *gx, const float *gy,
+    float *mag, int width, int height)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    int idx = y * width + x;
+    float gxv = gx[idx], gyv = gy[idx];
+    mag[idx] = sqrtf(gxv * gxv + gyv * gyv);
+}
+
+// Non-maximum Surpression Kernel
+
+__global__ void nms_cuda(const float *mag,
+    const float *gx,
+    const float *gy,
+    unsigned char *nms,
+    int width, int height)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1) return;
+
+    int idx = y * width + x;
+    float g  = mag[idx];
+
+    // Angle in degrees [0,180)
+    float angle = atan2f(gy[idx], gx[idx]) * 57.2957795f;  // 180/pi
+    if (angle < 0) angle += 180.f;
+
+    float g1, g2;
+    if ((angle <= 22.5f) || (angle > 157.5f)) {          // 0°
+    g1 = mag[idx - 1];
+    g2 = mag[idx + 1];
+    } else if (angle <= 67.5f) {                         // 45°
+    g1 = mag[(y - 1) * width + (x - 1)];
+    g2 = mag[(y + 1) * width + (x + 1)];
+    } else if (angle <= 112.5f) {                        // 90°
+    g1 = mag[(y - 1) * width +  x    ];
+    g2 = mag[(y + 1) * width +  x    ];
+    } else {                                             // 135°
+    g1 = mag[(y - 1) * width + (x + 1)];
+    g2 = mag[(y + 1) * width + (x - 1)];
+    }
+
+    nms[idx] = (g >= g1 && g >= g2) ? (unsigned char)__float2int_rn(fminf(g,255.f))
+                : 0;
+}
+
+__global__ void thresh_cuda(const unsigned char *in,  // NMS result
+    unsigned char       *out, // binary mask
+    int                  width,
+    int                  height,
+    unsigned char        thresh)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    int idx = y * width + x;
+    unsigned char v = in[idx];
+    out[idx] = (v >= thresh) ? 255 : 0;
+}
+
 // ------------------ Host Wrappers ------------------
 void create_gaussian_kernel(float *kernel, int ksize, float sigma) {
     int half = ksize / 2;
@@ -251,7 +355,31 @@ int main(int argc, char* argv[]) {
 
     apply_gaussian_smooth(d_gray, d_smooth, width, myHeight, 5, 1.0f);
 
-    cudaMemcpy(rgbf, d_smooth, graySize, cudaMemcpyDeviceToHost);
+    // ---------- Sobel gradients ----------
+    float *d_gx, *d_gy;
+    cudaMalloc(&d_gx, graySize);
+    cudaMalloc(&d_gy, graySize);
+
+    sobel_cuda<<<grid, block>>>(d_smooth, d_gx, d_gy, width, myHeight);
+    cudaDeviceSynchronize();
+
+    // ---------- Magnitude and Non-max surpression ----------
+    float        *d_mag;  cudaMalloc(&d_mag, graySize);
+    unsigned char*d_nms;  cudaMalloc(&d_nms, graySize);   // uchar output
+
+    mag_cuda <<<grid, block>>>(d_gx, d_gy, d_mag, width, myHeight);
+    nms_cuda <<<grid, block>>>(d_mag, d_gx, d_gy, d_nms, width, myHeight);
+    cudaDeviceSynchronize();
+
+    // ---------- Threshold to binary ----------
+    unsigned char *d_bin;  cudaMalloc(&d_bin, graySize);   // graySize bytes
+
+    const unsigned char TH = 20;  // IMPORTANT: Static threshold
+    thresh_cuda<<<grid, block>>>(d_nms, d_bin, width, myHeight, TH);
+    cudaDeviceSynchronize();
+
+    // cudaMemcpy(rgbf, d_smooth, graySize, cudaMemcpyDeviceToHost); // to output grayscale
+    cudaMemcpy(rgbf, d_bin, graySize, cudaMemcpyDeviceToHost);
 
     // Convert to uchar
     unsigned char *outc = (unsigned char*)malloc(graySize);
@@ -280,6 +408,135 @@ int main(int argc, char* argv[]) {
                 full, recvCounts, recvDispls,
                 MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
 
+    /////// TEST OUTPUT - THIS OUTPUTS IMAGE FROM THE SOBEL GRADIENTS
+
+    // --- Copy Sobel grads back to host and normalize to [0,255] ---
+    int   pixCount = width * myHeight;          // number of pixels in this stripe
+    float* gx_host = (float*)malloc(pixCount * sizeof(float));
+    float* gy_host = (float*)malloc(pixCount * sizeof(float));
+    cudaMemcpy(gx_host, d_gx, pixCount*sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(gy_host, d_gy, pixCount*sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Find local maximum absolute gradient
+    float local_max_gx = 0.f, local_max_gy = 0.f;
+    for(int i = 0; i < pixCount; i++){
+        local_max_gx = fmaxf(local_max_gx, fabsf(gx_host[i]));
+        local_max_gy = fmaxf(local_max_gy, fabsf(gy_host[i]));
+    }
+
+    // Reduce to global max across all ranks
+    float max_gx, max_gy;
+    MPI_Allreduce(&local_max_gx, &max_gx, 1, MPI_FLOAT, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_max_gy, &max_gy, 1, MPI_FLOAT, MPI_MAX, MPI_COMM_WORLD);
+
+    // Scale factors
+    float scale_gx = (max_gx > 0.f ? 255.f / max_gx : 1.f);
+    float scale_gy = (max_gy > 0.f ? 255.f / max_gy : 1.f);
+
+    // Convert to unsigned char
+    unsigned char *gx_uc = (unsigned char*)malloc(pixCount);
+    unsigned char *gy_uc = (unsigned char*)malloc(pixCount);
+    for(int i = 0; i < pixCount; i++){
+        int v1 = (int)fminf(255.f, fabsf(gx_host[i]) * scale_gx);
+        int v2 = (int)fminf(255.f, fabsf(gy_host[i]) * scale_gy);
+        gx_uc[i] = (unsigned char)v1;
+        gy_uc[i] = (unsigned char)v2;
+    }
+
+    free(gx_host);
+    free(gy_host);
+
+    // --- Gather gradient images back to rank 0 ---
+    unsigned char *full_gx = NULL, *full_gy = NULL;
+    if(rank == 0) {
+        full_gx = (unsigned char*)malloc(width * height);
+        full_gy = (unsigned char*)malloc(width * height);
+    }
+
+    // recvCounts / recvDispls are exactly as you set for your binary mask gather:
+    //   recvCounts[i] = (counts[i]/(width*channels)) * width;
+    //   recvDispls[i] = (displs[i]/(width*channels)) * width;
+    MPI_Gatherv(gx_uc,       pixCount, MPI_UNSIGNED_CHAR,
+                full_gx, recvCounts, recvDispls, MPI_UNSIGNED_CHAR,
+                0, MPI_COMM_WORLD);
+
+    MPI_Gatherv(gy_uc,       pixCount, MPI_UNSIGNED_CHAR,
+                full_gy, recvCounts, recvDispls, MPI_UNSIGNED_CHAR,
+                0, MPI_COMM_WORLD);
+
+    free(gx_uc);
+    free(gy_uc);
+
+    // --- On rank 0, write out the two gradient PNGs ---
+    if(rank == 0) {
+        writePNG("gx.png", full_gx, width, height, 1);
+        writePNG("gy.png", full_gy, width, height, 1);
+        free(full_gx);
+        free(full_gy);
+    }
+    
+    /////// END TEST OUTPUT OF SOBEL GRADIENT (Could delete this later)
+
+        // ----------------------------------------------------
+    // DEBUG: write out raw NMS map  ->  nms.png
+    // ----------------------------------------------------
+    {
+        /* 1. copy my stripe to host */
+        int pixCount = myHeight * width;      // pixels in this rank
+        unsigned char *nms_uc = (unsigned char*)malloc(pixCount);
+        cudaMemcpy(nms_uc, d_nms, pixCount, cudaMemcpyDeviceToHost);
+
+        /* 2. gather to rank‑0 (reuse recvCounts / recvDispls) */
+        unsigned char *full_nms = NULL;
+        if (rank == 0)
+            full_nms = (unsigned char*)malloc(width * height);
+
+        MPI_Gatherv(nms_uc,      pixCount, MPI_UNSIGNED_CHAR,
+                    full_nms, recvCounts, recvDispls, MPI_UNSIGNED_CHAR,
+                    0, MPI_COMM_WORLD);
+
+        free(nms_uc);
+
+        /* 3. rank‑0 writes PNG */
+        if (rank == 0) {
+            writePNG("nms.png", full_nms, width, height, 1);
+            free(full_nms);
+        }
+    }
+    // ----------------------------------------------------
+
+    // ----------------------------------------------------
+    // DEBUG: write out thresholded NMS -> thresh_debug.png
+    // ----------------------------------------------------
+    {
+        // 1. Launch with a low test threshold (e.g. 20)
+        const unsigned char DEBUG_T = 20;
+        thresh_cuda<<<grid,block>>>(d_nms, d_bin, width, myHeight, DEBUG_T);
+        cudaDeviceSynchronize();
+
+        // 2. Copy back stripe
+        int pixCount = myHeight * width;
+        unsigned char *th_uc = (unsigned char*)malloc(pixCount);
+        cudaMemcpy(th_uc, d_bin, pixCount, cudaMemcpyDeviceToHost);
+
+        // 3. Gather to rank 0
+        unsigned char *full_th = NULL;
+        if(rank == 0) full_th = (unsigned char*)malloc(width * height);
+
+        MPI_Gatherv(th_uc,      pixCount, MPI_UNSIGNED_CHAR,
+                    full_th, recvCounts, recvDispls, MPI_UNSIGNED_CHAR,
+                    0, MPI_COMM_WORLD);
+
+        free(th_uc);
+
+        // 4. Write PNG on rank 0
+        if(rank == 0) {
+            writePNG("thresh_debug_20.png", full_th, width, height, 1);
+            free(full_th);
+        }
+    }
+    // ----------------------------------------------------
+
     if (rank == 0) {
         writePNG("output.png", full, width, height, 1);
         free(full);
@@ -297,6 +554,9 @@ int main(int argc, char* argv[]) {
     cudaFree(d_rgb);
     cudaFree(d_gray);
     cudaFree(d_smooth);
+    cudaFree(d_gx);
+    cudaFree(d_gy);
+    cudaFree(d_bin);
     MPI_Finalize();
     return 0;
 }
