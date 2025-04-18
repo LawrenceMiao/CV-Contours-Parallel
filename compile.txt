@@ -1,0 +1,2 @@
+nvcc -c io.cu -o io.o -I/usr/lib/x86_64-linux-gnu/openmpi/include -I/usr/local/cuda/include
+mpicxx io.o -o io -L/usr/local/cuda/lib64 -lcudart -lpng
