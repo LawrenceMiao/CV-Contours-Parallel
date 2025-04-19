@@ -1,2 +1,6 @@
 nvcc -c io.cu -o io.o -I/usr/lib/x86_64-linux-gnu/openmpi/include -I/usr/local/cuda/include
 mpicxx io.o -o io -L/usr/local/cuda/lib64 -lcudart -lpng
+
+
+
+nvcc -arch=sm_70 -ccbin mpixlc -I/usr/local/cuda-11.2/include io.cu -L/usr/local/cuda-11.2/lib64 -lcudadevrt -lcudart -lpng -o io
