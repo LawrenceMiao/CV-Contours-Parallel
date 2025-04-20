@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <mpi.h>
 #include <png.h>
 #include <cuda_runtime.h>
@@ -277,6 +278,15 @@ GrayImage binaryToGray(const char *filename)
     return img;
 }
 
+// Structure to hold gradient information
+typedef struct
+{
+    int width;
+    int height;
+    float *magnitude;
+    float *direction;
+} GradientImage;
+
 // CUDA kernel for RGB to Grayscale conversion
 __global__ void rgbToGrayscaleKernel(unsigned char *d_input, unsigned char *d_output, int width, int height, int startRow, int endRow)
 {
@@ -331,6 +341,182 @@ __global__ void gaussianBlurKernel(unsigned char *d_input, unsigned char *d_outp
         }
 
         d_output[y * width + x] = (unsigned char)sum;
+    }
+}
+
+// CUDA kernel for Sobel operator in x direction
+__global__ void sobelXKernel(unsigned char *d_input, float *d_output, int width, int height, int startRow, int endRow)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y + startRow;
+
+    if (x < width && y < endRow && y >= startRow)
+    {
+        // 3x3 Sobel X kernel
+        const int kernel[3][3] = {
+            {-1, 0, 1},
+            {-2, 0, 2},
+            {-1, 0, 1}};
+
+        float sum = 0.0f;
+        for (int ky = -1; ky <= 1; ky++)
+        {
+            for (int kx = -1; kx <= 1; kx++)
+            {
+                int ix = x + kx;
+                int iy = y + ky;
+
+                // Handle boundary conditions
+                ix = max(0, min(width - 1, ix));
+                iy = max(0, min(height - 1, iy));
+
+                int inputOffset = iy * width + ix;
+                sum += kernel[ky + 1][kx + 1] * d_input[inputOffset];
+            }
+        }
+
+        d_output[y * width + x] = sum;
+    }
+}
+
+// CUDA kernel for Sobel operator in y direction
+__global__ void sobelYKernel(unsigned char *d_input, float *d_output, int width, int height, int startRow, int endRow)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y + startRow;
+
+    if (x < width && y < endRow && y >= startRow)
+    {
+        // 3x3 Sobel Y kernel
+        const int kernel[3][3] = {
+            {-1, -2, -1},
+            {0, 0, 0},
+            {1, 2, 1}};
+
+        float sum = 0.0f;
+        for (int ky = -1; ky <= 1; ky++)
+        {
+            for (int kx = -1; kx <= 1; kx++)
+            {
+                int ix = x + kx;
+                int iy = y + ky;
+
+                // Handle boundary conditions
+                ix = max(0, min(width - 1, ix));
+                iy = max(0, min(height - 1, iy));
+
+                int inputOffset = iy * width + ix;
+                sum += kernel[ky + 1][kx + 1] * d_input[inputOffset];
+            }
+        }
+
+        d_output[y * width + x] = sum;
+    }
+}
+
+// CUDA kernel to compute gradient magnitude and direction
+__global__ void gradientKernel(float *d_gradient_x, float *d_gradient_y, float *d_magnitude, float *d_direction, int width, int height, int startRow, int endRow)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y + startRow;
+
+    if (x < width && y < endRow && y >= startRow)
+    {
+        int idx = y * width + x;
+        float gx = d_gradient_x[idx];
+        float gy = d_gradient_y[idx];
+
+        // Compute magnitude
+        d_magnitude[idx] = sqrtf(gx * gx + gy * gy);
+
+        // Compute direction (in radians)
+        d_direction[idx] = atan2f(gy, gx);
+    }
+}
+
+// CUDA kernel for non-maximum suppression
+__global__ void nonMaxSuppressionKernel(float *d_magnitude, float *d_direction, unsigned char *d_output, int width, int height, int startRow, int endRow)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y + startRow;
+
+    if (x < width && y < endRow && y >= startRow)
+    {
+        int idx = y * width + x;
+        float mag = d_magnitude[idx];
+        float dir = d_direction[idx];
+
+        // Convert direction to discrete angle (0, 45, 90, 135 degrees)
+        dir = dir * 180.0f / M_PI;
+        if (dir < 0)
+            dir += 180.0f;
+
+        int angle = ((int)(dir + 22.5f) % 180) / 45;
+
+        // Define neighbor offsets based on the angle
+        int nx1, ny1, nx2, ny2;
+
+        switch (angle)
+        {
+        case 0: // 0 degrees (horizontal)
+            nx1 = -1;
+            ny1 = 0;
+            nx2 = 1;
+            ny2 = 0;
+            break;
+        case 1: // 45 degrees (diagonal)
+            nx1 = -1;
+            ny1 = -1;
+            nx2 = 1;
+            ny2 = 1;
+            break;
+        case 2: // 90 degrees (vertical)
+            nx1 = 0;
+            ny1 = -1;
+            nx2 = 0;
+            ny2 = 1;
+            break;
+        case 3: // 135 degrees (diagonal)
+            nx1 = -1;
+            ny1 = 1;
+            nx2 = 1;
+            ny2 = -1;
+            break;
+        default:
+            nx1 = 0;
+            ny1 = 0;
+            nx2 = 0;
+            ny2 = 0;
+        }
+
+        // Ensure neighbors are within bounds
+        int x1 = min(width - 1, max(0, x + nx1));
+        int y1 = min(height - 1, max(0, y + ny1));
+        int x2 = min(width - 1, max(0, x + nx2));
+        int y2 = min(height - 1, max(0, y + ny2));
+
+        float mag1 = d_magnitude[y1 * width + x1];
+        float mag2 = d_magnitude[y2 * width + x2];
+
+        // Apply non-maximum suppression
+        if (mag >= mag1 && mag >= mag2)
+        {
+            // Keep this pixel only if it's a local maximum
+            // Apply thresholding (can be adjusted)
+            const float highThreshold = 50.0f;
+            if (mag > highThreshold)
+            {
+                d_output[idx] = 255; // Strong edge
+            }
+            else
+            {
+                d_output[idx] = 0; // Non-edge
+            }
+        }
+        else
+        {
+            d_output[idx] = 0; // Suppress non-maximum
+        }
     }
 }
 
@@ -405,7 +591,7 @@ int main(int argc, char **argv)
     printf("Rank %d: Processing rows %d to %d (total %d rows)\n", rank, startRow, endRow - 1, endRow - startRow);
 
     // Allocate memory for grayscale intermediate and final image data
-    GrayImage grayImg, blurredImg;
+    GrayImage grayImg, blurredImg, edgesImg;
     grayImg.width = width;
     grayImg.height = height;
     grayImg.data = (unsigned char *)malloc(width * height);
@@ -414,9 +600,23 @@ int main(int argc, char **argv)
     blurredImg.height = height;
     blurredImg.data = (unsigned char *)malloc(width * height);
 
-    // Zero out both images
+    edgesImg.width = width;
+    edgesImg.height = height;
+    edgesImg.data = (unsigned char *)malloc(width * height);
+
+    // Allocate memory for gradient information
+    GradientImage gradientImg;
+    gradientImg.width = width;
+    gradientImg.height = height;
+    gradientImg.magnitude = (float *)malloc(width * height * sizeof(float));
+    gradientImg.direction = (float *)malloc(width * height * sizeof(float));
+
+    // Zero out all images
     memset(grayImg.data, 0, width * height);
     memset(blurredImg.data, 0, width * height);
+    memset(edgesImg.data, 0, width * height);
+    memset(gradientImg.magnitude, 0, width * height * sizeof(float));
+    memset(gradientImg.direction, 0, width * height * sizeof(float));
 
     // Setup CUDA
     int deviceCount;
@@ -430,10 +630,17 @@ int main(int argc, char **argv)
     cudaSetDevice(rank % deviceCount);
 
     // Allocate device memory
-    unsigned char *d_rgbData, *d_grayData, *d_blurredData;
+    unsigned char *d_rgbData, *d_grayData, *d_blurredData, *d_edgesData;
+    float *d_gradientX, *d_gradientY, *d_magnitude, *d_direction;
+
     cudaMalloc(&d_rgbData, width * height * 3);
     cudaMalloc(&d_grayData, width * height);
     cudaMalloc(&d_blurredData, width * height);
+    cudaMalloc(&d_edgesData, width * height);
+    cudaMalloc(&d_gradientX, width * height * sizeof(float));
+    cudaMalloc(&d_gradientY, width * height * sizeof(float));
+    cudaMalloc(&d_magnitude, width * height * sizeof(float));
+    cudaMalloc(&d_direction, width * height * sizeof(float));
 
     // Copy RGB data to device
     cudaMemcpy(d_rgbData, rgbImg.data, width * height * 3, cudaMemcpyHostToDevice);
@@ -475,8 +682,6 @@ int main(int argc, char **argv)
                    MPI_COMM_WORLD);
 
     free(tempGrayData);
-    free(recvcounts);
-    free(displs);
 
     // Copy the complete grayscale image back to device
     cudaMemcpy(d_grayData, grayImg.data, width * height, cudaMemcpyHostToDevice);
@@ -489,12 +694,76 @@ int main(int argc, char **argv)
     cudaMemcpy(blurredImg.data + startRow * width, d_blurredData + startRow * width,
                (endRow - startRow) * width, cudaMemcpyDeviceToHost);
 
+    // Step 7: Share blurred data across ranks for edge detection
+    tempGrayData = (unsigned char *)malloc((endRow - startRow) * width);
+    memcpy(tempGrayData, blurredImg.data + startRow * width, (endRow - startRow) * width);
+
+    MPI_Allgatherv(tempGrayData, (endRow - startRow) * width, MPI_UNSIGNED_CHAR,
+                   blurredImg.data, recvcounts, displs, MPI_UNSIGNED_CHAR,
+                   MPI_COMM_WORLD);
+
+    free(tempGrayData);
+
+    // Copy the complete blurred image back to device
+    cudaMemcpy(d_blurredData, blurredImg.data, width * height, cudaMemcpyHostToDevice);
+
+    // Step 8: Apply Sobel operators for edge detection
+    sobelXKernel<<<gridDim, blockDim>>>(d_blurredData, d_gradientX, width, height, startRow, endRow);
+    sobelYKernel<<<gridDim, blockDim>>>(d_blurredData, d_gradientY, width, height, startRow, endRow);
+    cudaDeviceSynchronize();
+
+    // Step 9: Compute gradient magnitude and direction
+    gradientKernel<<<gridDim, blockDim>>>(d_gradientX, d_gradientY, d_magnitude, d_direction, width, height, startRow, endRow);
+    cudaDeviceSynchronize();
+
+    // Copy gradient data to host for our partition
+    cudaMemcpy(gradientImg.magnitude + startRow * width, d_magnitude + startRow * width,
+               (endRow - startRow) * width * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(gradientImg.direction + startRow * width, d_direction + startRow * width,
+               (endRow - startRow) * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Step 10: Share gradient data across ranks for NMS
+    float *tempMagnitude = (float *)malloc((endRow - startRow) * width * sizeof(float));
+    float *tempDirection = (float *)malloc((endRow - startRow) * width * sizeof(float));
+
+    memcpy(tempMagnitude, gradientImg.magnitude + startRow * width, (endRow - startRow) * width * sizeof(float));
+    memcpy(tempDirection, gradientImg.direction + startRow * width, (endRow - startRow) * width * sizeof(float));
+
+    // Use MPI_Allgatherv for floating point data
+    MPI_Allgatherv(tempMagnitude, (endRow - startRow) * width, MPI_FLOAT,
+                   gradientImg.magnitude, recvcounts, displs, MPI_FLOAT,
+                   MPI_COMM_WORLD);
+
+    MPI_Allgatherv(tempDirection, (endRow - startRow) * width, MPI_FLOAT,
+                   gradientImg.direction, recvcounts, displs, MPI_FLOAT,
+                   MPI_COMM_WORLD);
+
+    free(tempMagnitude);
+    free(tempDirection);
+
+    // Copy the complete gradient data back to device
+    cudaMemcpy(d_magnitude, gradientImg.magnitude, width * height * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_direction, gradientImg.direction, width * height * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Step 11: Apply non-maximum suppression
+    nonMaxSuppressionKernel<<<gridDim, blockDim>>>(d_magnitude, d_direction, d_edgesData, width, height, startRow, endRow);
+    cudaDeviceSynchronize();
+
+    // Copy edge detection result back to host (only for our partition)
+    cudaMemcpy(edgesImg.data + startRow * width, d_edgesData + startRow * width,
+               (endRow - startRow) * width, cudaMemcpyDeviceToHost);
+
     // Free CUDA memory
     cudaFree(d_rgbData);
     cudaFree(d_grayData);
     cudaFree(d_blurredData);
+    cudaFree(d_edgesData);
+    cudaFree(d_gradientX);
+    cudaFree(d_gradientY);
+    cudaFree(d_magnitude);
+    cudaFree(d_direction);
 
-    // Step 7: Use MPI I/O to write the output binary file in parallel
+    // Step 12: Use MPI I/O to write the output binary file in parallel
     MPI_File fh;
     MPI_Status status;
 
@@ -517,14 +786,14 @@ int main(int argc, char **argv)
     MPI_Offset headerSize = 2 * sizeof(int);
     MPI_Offset offset = headerSize + startRow * width;
 
-    // Write each rank's portion of the data
-    MPI_File_write_at(fh, offset, blurredImg.data + startRow * width,
+    // Write each rank's portion of the data (edge detection result)
+    MPI_File_write_at(fh, offset, edgesImg.data + startRow * width,
                       (endRow - startRow) * width, MPI_UNSIGNED_CHAR, &status);
 
     // Close the file
     MPI_File_close(&fh);
 
-    // Step 8: Convert binary to PNG (only rank 0)
+    // Step 13: Convert binary to PNG (only rank 0)
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0)
     {
@@ -543,7 +812,12 @@ int main(int argc, char **argv)
     // Clean up
     free(grayImg.data);
     free(blurredImg.data);
+    free(edgesImg.data);
+    free(gradientImg.magnitude);
+    free(gradientImg.direction);
     free(rgbImg.data);
+    free(recvcounts);
+    free(displs);
 
     MPI_Finalize();
     return 0;
