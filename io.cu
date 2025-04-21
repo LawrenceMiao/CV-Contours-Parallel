@@ -5,6 +5,8 @@
 #include <mpi.h>
 #include <png.h>
 #include <cuda_runtime.h>
+#include <inttypes.h>       // for PRIu64 in printf
+#include "clockcycle.h"     // POWER9 cycle counter
 
 // Structure to represent an RGB image
 typedef struct
@@ -580,6 +582,10 @@ int main(int argc, char **argv)
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
+    /* <<<  start the timed region  >>> */
+    MPI_Barrier(MPI_COMM_WORLD);        // full sync before timing starts
+    uint64_t t0 = clock_now();
+
     // Step 3: Determine the partition for this rank
     int rowsPerRank = height / size;
     int extraRows = height % size;
@@ -792,6 +798,26 @@ int main(int argc, char **argv)
 
     // Close the file
     MPI_File_close(&fh);
+
+    // ------ TIMING CODE -------
+    /* <<<  end the timed region  >>> */
+    MPI_Barrier(MPI_COMM_WORLD);        // full sync so ranks stop together
+    uint64_t t1 = clock_now();
+    uint64_t local_cycles = t1 - t0;
+    double   local_sec    = local_cycles / 512e6;   // 512 MHz on POWER9
+
+    printf("Rank %d pipeline time: %.6f s (%" PRIu64 " cycles)\n",
+       rank, local_sec, local_cycles);
+
+    /*  Option B (recommended for scaling studies):                              */
+    /*  collect the slowest rank’s time so you know the real wall‑clock cost     */
+    uint64_t max_cycles;
+    MPI_Reduce(&local_cycles, &max_cycles,
+            1, MPI_UINT64_T, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0)
+        printf("MAX pipeline time across %d ranks: %.6f s (%" PRIu64 " cycles)\n",
+            size, max_cycles / 512e6, max_cycles);
+    // --------------------------
 
     // Step 13: Convert binary to PNG (only rank 0)
     MPI_Barrier(MPI_COMM_WORLD);
