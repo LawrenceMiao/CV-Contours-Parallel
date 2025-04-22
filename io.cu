@@ -5,13 +5,7 @@
 #include <mpi.h>
 #include <png.h>
 #include <cuda_runtime.h>
-#include <inttypes.h>   // for PRIu64 in printf
 #include "clockcycle.h" // POWER9 cycle counter
-
-// Define maximum number of contours and points per contour
-#define MAX_CONTOURS 5000
-#define MAX_POINTS_PER_CONTOUR 5000
-#define MAX_CONTOUR_BUFFER_SIZE (MAX_CONTOURS * MAX_POINTS_PER_CONTOUR)
 
 // Structure to represent an RGB image
 typedef struct
@@ -453,12 +447,13 @@ __global__ void nonMaxSuppressionKernel(float *d_magnitude, float *d_direction, 
         float mag = d_magnitude[idx];
         float dir = d_direction[idx];
 
-        // Convert direction to discrete angle (0, 45, 90, 135 degrees)
-        dir = dir * 180.0f / M_PI;
-        if (dir < 0)
-            dir += 180.0f;
+        // Convert direction to degrees and normalize to 0-180
+        float dirDegrees = dir * 180.0f / 3.14159265358979323846f;
+        if (dirDegrees < 0)
+            dirDegrees += 180.0f;
 
-        int angle = ((int)(dir + 22.5f) % 180) / 45;
+        // Round to nearest 45 degrees
+        int angle = ((int)(dirDegrees + 22.5f) % 180) / 45;
 
         // Define neighbor offsets based on the angle
         int nx1, ny1, nx2, ny2;
@@ -527,105 +522,6 @@ __global__ void nonMaxSuppressionKernel(float *d_magnitude, float *d_direction, 
     }
 }
 
-// CUDA kernel to find potential contour start points
-__global__ void findContourStartPointsKernel(unsigned char *d_edges, int *d_starts, int *d_numStarts, int width, int height, int startRow, int endRow)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y + startRow;
-
-    if (x < width && y < endRow && y >= startRow)
-    {
-        int idx = y * width + x;
-
-        // Check if this is an edge pixel
-        if (d_edges[idx] == 255)
-        {
-            // Check if it's a potential contour start point (left-most edge pixel in its row)
-            if (x == 0 || d_edges[idx - 1] == 0)
-            {
-                // Use atomic operation to safely add this point to the starts array
-                int startIdx = atomicAdd(d_numStarts, 1);
-
-                // Ensure we don't exceed the buffer size
-                if (startIdx < MAX_CONTOURS)
-                {
-                    d_starts[startIdx * 2] = x;
-                    d_starts[startIdx * 2 + 1] = y;
-                }
-            }
-        }
-    }
-}
-
-// Helper function to trace a contour from a starting point (executed on CPU)
-void traceContour(unsigned char *edges, int width, int height, int startX, int startY,
-                  Point *points, int *numPoints, bool *visited)
-{
-    // Direction offsets for 8-connected neighbors (clockwise order)
-    const int dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
-    const int dy[8] = {0, 1, 1, 1, 0, -1, -1, -1};
-
-    int x = startX;
-    int y = startY;
-    int dir = 7; // Start direction (NE)
-
-    // Mark start point as visited
-    visited[y * width + x] = true;
-
-    // Add start point to contour
-    points[0].x = x;
-    points[0].y = y;
-    *numPoints = 1;
-
-    // Define maximum attempts to avoid infinite loops
-    int maxAttempts = width * height;
-    int attempts = 0;
-
-    while (attempts < maxAttempts)
-    {
-        // Search for the next edge pixel in clockwise order
-        bool found = false;
-        for (int i = 0; i < 8; i++)
-        {
-            int newDir = (dir + i) % 8;
-            int nx = x + dx[newDir];
-            int ny = y + dy[newDir];
-
-            // Check if the neighbor is valid and is an edge
-            if (nx >= 0 && nx < width && ny >= 0 && ny < height &&
-                edges[ny * width + nx] == 255 && !visited[ny * width + nx])
-            {
-                // Move to the next edge pixel
-                x = nx;
-                y = ny;
-                dir = (newDir + 6) % 8; // Look in the opposite direction next time
-
-                // Mark as visited
-                visited[y * width + x] = true;
-
-                // Add to contour
-                if (*numPoints < MAX_POINTS_PER_CONTOUR)
-                {
-                    points[*numPoints].x = x;
-                    points[*numPoints].y = y;
-                    (*numPoints)++;
-                }
-
-                found = true;
-                break;
-            }
-        }
-
-        // If no neighbor is found or we've returned to the start, exit
-        if (!found || (x == startX && y == startY && *numPoints > 1))
-        {
-            break;
-        }
-
-        attempts++;
-    }
-}
-
 int main(int argc, char **argv)
 {
     if (argc != 3)
@@ -686,10 +582,6 @@ int main(int argc, char **argv)
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    /* <<<  start the timed region  >>> */
-    MPI_Barrier(MPI_COMM_WORLD); // full sync before timing starts
-    uint64_t t0 = clock_now();
-
     // Step 3: Determine the partition for this rank
     int rowsPerRank = height / size;
     int extraRows = height % size;
@@ -701,7 +593,7 @@ int main(int argc, char **argv)
     printf("Rank %d: Processing rows %d to %d (total %d rows)\n", rank, startRow, endRow - 1, endRow - startRow);
 
     // Allocate memory for grayscale intermediate and final image data
-    GrayImage grayImg, blurredImg, edgesImg, contourImg;
+    GrayImage grayImg, blurredImg, edgesImg;
     grayImg.width = width;
     grayImg.height = height;
     grayImg.data = (unsigned char *)malloc(width * height);
@@ -714,10 +606,6 @@ int main(int argc, char **argv)
     edgesImg.height = height;
     edgesImg.data = (unsigned char *)malloc(width * height);
 
-    contourImg.width = width;
-    contourImg.height = height;
-    contourImg.data = (unsigned char *)malloc(width * height);
-
     // Allocate memory for gradient information
     GradientImage gradientImg;
     gradientImg.width = width;
@@ -729,7 +617,6 @@ int main(int argc, char **argv)
     memset(grayImg.data, 0, width * height);
     memset(blurredImg.data, 0, width * height);
     memset(edgesImg.data, 0, width * height);
-    memset(contourImg.data, 0, width * height);
     memset(gradientImg.magnitude, 0, width * height * sizeof(float));
     memset(gradientImg.direction, 0, width * height * sizeof(float));
 
@@ -744,29 +631,26 @@ int main(int argc, char **argv)
 
     cudaSetDevice(rank % deviceCount);
 
+    /* <<<  start the timed region  >>> */
+    MPI_Barrier(MPI_COMM_WORLD); // full sync before timing starts
+
+    if (rank == 0)
+    {
+        uint64_t t0 = clock_now();
+    }
+
     // Allocate device memory
-    unsigned char *d_rgbData, *d_grayData, *d_blurredData, *d_edgesData, *d_contourData;
+    unsigned char *d_rgbData, *d_grayData, *d_blurredData, *d_edgesData;
     float *d_gradientX, *d_gradientY, *d_magnitude, *d_direction;
-    int *d_contourStartPoints, *d_numStartPoints;
 
     cudaMalloc(&d_rgbData, width * height * 3);
     cudaMalloc(&d_grayData, width * height);
     cudaMalloc(&d_blurredData, width * height);
     cudaMalloc(&d_edgesData, width * height);
-    cudaMalloc(&d_contourData, width * height);
     cudaMalloc(&d_gradientX, width * height * sizeof(float));
     cudaMalloc(&d_gradientY, width * height * sizeof(float));
     cudaMalloc(&d_magnitude, width * height * sizeof(float));
     cudaMalloc(&d_direction, width * height * sizeof(float));
-    cudaMalloc(&d_contourStartPoints, MAX_CONTOURS * 2 * sizeof(int)); // Store x,y coordinates
-    cudaMalloc(&d_numStartPoints, sizeof(int));
-
-    // Initialize the number of start points to 0
-    int zero = 0;
-    cudaMemcpy(d_numStartPoints, &zero, sizeof(int), cudaMemcpyHostToDevice);
-
-    // Zero out the contour data on device
-    cudaMemset(d_contourData, 0, width * height);
 
     // Copy RGB data to device
     cudaMemcpy(d_rgbData, rgbImg.data, width * height * 3, cudaMemcpyHostToDevice);
@@ -835,11 +719,32 @@ int main(int argc, char **argv)
 
     // Step 8: Apply Sobel operators for edge detection
     sobelXKernel<<<gridDim, blockDim>>>(d_blurredData, d_gradientX, width, height, startRow, endRow);
+    cudaError_t errX = cudaGetLastError();
+    if (errX != cudaSuccess)
+    {
+        printf("Rank %d: Error in sobelXKernel: %s\n", rank, cudaGetErrorString(errX));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     sobelYKernel<<<gridDim, blockDim>>>(d_blurredData, d_gradientY, width, height, startRow, endRow);
+    cudaError_t errY = cudaGetLastError();
+    if (errY != cudaSuccess)
+    {
+        printf("Rank %d: Error in sobelYKernel: %s\n", rank, cudaGetErrorString(errY));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     cudaDeviceSynchronize();
 
     // Step 9: Compute gradient magnitude and direction
     gradientKernel<<<gridDim, blockDim>>>(d_gradientX, d_gradientY, d_magnitude, d_direction, width, height, startRow, endRow);
+    cudaError_t errG = cudaGetLastError();
+    if (errG != cudaSuccess)
+    {
+        printf("Rank %d: Error in gradientKernel: %s\n", rank, cudaGetErrorString(errG));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     cudaDeviceSynchronize();
 
     // Copy gradient data to host for our partition
@@ -873,128 +778,40 @@ int main(int argc, char **argv)
 
     // Step 11: Apply non-maximum suppression
     nonMaxSuppressionKernel<<<gridDim, blockDim>>>(d_magnitude, d_direction, d_edgesData, width, height, startRow, endRow);
+    cudaError_t errNMS = cudaGetLastError();
+    if (errNMS != cudaSuccess)
+    {
+        printf("Rank %d: Error in nonMaxSuppressionKernel: %s\n", rank, cudaGetErrorString(errNMS));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     cudaDeviceSynchronize();
 
     // Copy edge detection result back to host (only for our partition)
     cudaMemcpy(edgesImg.data + startRow * width, d_edgesData + startRow * width,
                (endRow - startRow) * width, cudaMemcpyDeviceToHost);
 
-    // Step 12: Share edges data across ranks for contour finding
-    tempGrayData = (unsigned char *)malloc((endRow - startRow) * width);
-    memcpy(tempGrayData, edgesImg.data + startRow * width, (endRow - startRow) * width);
+    // Free CUDA memory
+    cudaFree(d_rgbData);
+    cudaFree(d_grayData);
+    cudaFree(d_blurredData);
+    cudaFree(d_edgesData);
+    cudaFree(d_gradientX);
+    cudaFree(d_gradientY);
+    cudaFree(d_magnitude);
+    cudaFree(d_direction);
 
-    MPI_Allgatherv(tempGrayData, (endRow - startRow) * width, MPI_UNSIGNED_CHAR,
-                   edgesImg.data, recvcounts, displs, MPI_UNSIGNED_CHAR,
-                   MPI_COMM_WORLD);
+    // ------ TIMING CODE -------
+    /* <<<  end the timed region  >>> */
+    MPI_Barrier(MPI_COMM_WORLD); // full sync so ranks stop together
 
-    free(tempGrayData);
-
-    // Copy the complete edges data back to device
-    cudaMemcpy(d_edgesData, edgesImg.data, width * height, cudaMemcpyHostToDevice);
-
-    // Step 13: Find potential contour starting points in parallel
-    findContourStartPointsKernel<<<gridDim, blockDim>>>(d_edgesData, d_contourStartPoints, d_numStartPoints,
-                                                        width, height, startRow, endRow);
-    cudaDeviceSynchronize();
-
-    // Get the number of contour starting points found by this rank
-    int numStartPoints;
-    cudaMemcpy(&numStartPoints, d_numStartPoints, sizeof(int), cudaMemcpyDeviceToHost);
-
-    printf("Rank %d: Found %d potential contour starting points\n", rank, numStartPoints);
-
-    // Allocate memory for contour starting points
-    int *contourStartPoints = (int *)malloc(numStartPoints * 2 * sizeof(int));
-
-    // Copy contour starting points from device to host
-    cudaMemcpy(contourStartPoints, d_contourStartPoints, numStartPoints * 2 * sizeof(int), cudaMemcpyDeviceToHost);
-
-    // Step 14: Trace contours in parallel on CPU
-    // We'll use a boolean array to track visited pixels
-    bool *visited = (bool *)calloc(width * height, sizeof(bool));
-
-    // Allocate memory for contours
-    ContourList contourList;
-    contourList.contours = (Contour *)malloc(numStartPoints * sizeof(Contour));
-    contourList.num_contours = 0;
-
-    // Process each contour starting point
-    for (int i = 0; i < numStartPoints; i++)
-    {
-        int startX = contourStartPoints[i * 2];
-        int startY = contourStartPoints[i * 2 + 1];
-
-        // Skip if this pixel has already been visited
-        if (visited[startY * width + startX])
-        {
-            continue;
-        }
-
-        // Allocate memory for the points in this contour
-        contourList.contours[contourList.num_contours].points = (Point *)malloc(MAX_POINTS_PER_CONTOUR * sizeof(Point));
-        contourList.contours[contourList.num_contours].num_points = 0;
-
-        // Trace the contour
-        traceContour(edgesImg.data, width, height, startX, startY,
-                     contourList.contours[contourList.num_contours].points,
-                     &contourList.contours[contourList.num_contours].num_points,
-                     visited);
-
-        // Only keep contours with more than a minimum number of points
-        if (contourList.contours[contourList.num_contours].num_points > 10)
-        {
-            contourList.num_contours++;
-        }
-        else
-        {
-            free(contourList.contours[contourList.num_contours].points);
-        }
-    }
-
-    printf("Rank %d: Found %d valid contours\n", rank, contourList.num_contours);
-
-    // Step 15: Visualize contours on the output image
-    // Draw contours on the output image (white on black background)
-    memset(contourImg.data, 0, width * height); // Black background
-
-    for (int i = 0; i < contourList.num_contours; i++)
-    {
-        for (int j = 0; j < contourList.contours[i].num_points; j++)
-        {
-            int x = contourList.contours[i].points[j].x;
-            int y = contourList.contours[i].points[j].y;
-
-            // Draw white pixel
-            if (x >= 0 && x < width && y >= 0 && y < height)
-            {
-                contourImg.data[y * width + x] = 255;
-            }
-        }
-    }
-
-    // Step 16: Gather contour information from all ranks to rank 0
     if (rank == 0)
     {
-        // Only rank 0 needs to gather all contour results
-        for (int i = 1; i < size; i++)
-        {
-            int remoteRows = i * rowsPerRank + min(i, extraRows);
-            int remoteEndRow = remoteRows + rowsPerRank + (i < extraRows ? 1 : 0);
-            int remoteRowCount = remoteEndRow - remoteRows;
-
-            // Receive contour data from each rank
-            MPI_Recv(contourImg.data + remoteRows * width, remoteRowCount * width,
-                     MPI_UNSIGNED_CHAR, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        }
+        uint64_t t1 = clock_now();
+        uint64_t local_cycles = t1 - t0;
+        printf("Rank %d: Total cycles: %lu\n", rank, local_cycles);
     }
-    else
-    {
-        // Other ranks send their contour data to rank 0
-        MPI_Send(contourImg.data + startRow * width, (endRow - startRow) * width,
-                 MPI_UNSIGNED_CHAR, 0, 0, MPI_COMM_WORLD);
-    }
-
-    // Step 17: Use MPI I/O to write the output binary file in parallel (using the contour image)
+    // Step 12: Use MPI I/O to write the output binary file in parallel
     MPI_File fh;
     MPI_Status status;
 
@@ -1017,38 +834,17 @@ int main(int argc, char **argv)
     MPI_Offset headerSize = 2 * sizeof(int);
     MPI_Offset offset = headerSize + startRow * width;
 
-    // Write each rank's portion of the data (contour detection result)
-    MPI_File_write_at(fh, offset, contourImg.data + startRow * width,
+    // Write each rank's portion of the data (edge detection result)
+    MPI_File_write_at(fh, offset, edgesImg.data + startRow * width,
                       (endRow - startRow) * width, MPI_UNSIGNED_CHAR, &status);
 
     // Close the file
     MPI_File_close(&fh);
 
-    // ------ TIMING CODE -------
-    /* <<<  end the timed region  >>> */
-    MPI_Barrier(MPI_COMM_WORLD); // full sync so ranks stop together
-    uint64_t t1 = clock_now();
-    uint64_t local_cycles = t1 - t0;
-    double local_sec = local_cycles / 512e6; // 512 MHz on POWER9
-
-    printf("Rank %d pipeline time: %.6f s (%" PRIu64 " cycles)\n",
-           rank, local_sec, local_cycles);
-
-    /*  Option B (recommended for scaling studies):                              */
-    /*  collect the slowest rank’s time so you know the real wall‑clock cost     */
-    uint64_t max_cycles;
-    MPI_Reduce(&local_cycles, &max_cycles,
-               1, MPI_UINT64_T, MPI_MAX, 0, MPI_COMM_WORLD);
-    if (rank == 0)
-        printf("MAX pipeline time across %d ranks: %.6f s (%" PRIu64 " cycles)\n",
-               size, max_cycles / 512e6, max_cycles);
-    // --------------------------
-
     // Step 13: Convert binary to PNG (only rank 0)
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0)
     {
-
         printf("Rank %d: Converting binary to PNG %s\n", rank, outputPNG);
         GrayImage outputImg = binaryToGray(outputBinary);
         if (outputImg.width == 0 || outputImg.height == 0)
@@ -1061,38 +857,18 @@ int main(int argc, char **argv)
         free(outputImg.data);
     }
 
-    // Clean up contours
-    for (int i = 0; i < contourList.num_contours; i++)
-    {
-        free(contourList.contours[i].points);
-    }
-    free(contourList.contours);
-    free(contourStartPoints);
-    free(visited);
+    // One final barrier to ensure all ranks wait for rank 0 to finish writing the PNG
+    MPI_Barrier(MPI_COMM_WORLD);
 
-    // Clean up other resources
+    // Clean up
     free(grayImg.data);
     free(blurredImg.data);
     free(edgesImg.data);
-    free(contourImg.data);
     free(gradientImg.magnitude);
     free(gradientImg.direction);
     free(rgbImg.data);
     free(recvcounts);
     free(displs);
-
-    // Free CUDA memory
-    cudaFree(d_rgbData);
-    cudaFree(d_grayData);
-    cudaFree(d_blurredData);
-    cudaFree(d_edgesData);
-    cudaFree(d_contourData);
-    cudaFree(d_gradientX);
-    cudaFree(d_gradientY);
-    cudaFree(d_magnitude);
-    cudaFree(d_direction);
-    cudaFree(d_contourStartPoints);
-    cudaFree(d_numStartPoints);
 
     MPI_Finalize();
     return 0;
