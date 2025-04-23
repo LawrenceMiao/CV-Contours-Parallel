@@ -1,5 +1,5 @@
 login.txt
 stacked_images
 stacked_images/*
-*/bin
+*.bin
 *.o
