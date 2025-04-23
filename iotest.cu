@@ -599,9 +599,9 @@ int main(int argc, char **argv)
     size_t grayBytes = width*height;
     size_t floatBytes= grayBytes*sizeof(float);
 
-    GrayImage grayImg   ={width,height,(unsigned char*)malloc(grayBytes)};
+    GrayImage grayImg ={width,height,(unsigned char*)malloc(grayBytes)};
     GrayImage blurredImg={width,height,(unsigned char*)malloc(grayBytes)};
-    GrayImage edgesImg  ={width,height,(unsigned char*)malloc(grayBytes)};
+    GrayImage edgesImg ={width,height,(unsigned char*)malloc(grayBytes)};
 
     GradientImage gradImg;
     gradImg.width=width; gradImg.height=height;
@@ -610,14 +610,14 @@ int main(int argc, char **argv)
 
     unsigned char *d_rgb, *d_gray, *d_blur, *d_edges;
     float *d_gx,*d_gy,*d_mag,*d_dir;
-    cudaMalloc(&d_rgb , rgbBytes);
+    cudaMalloc(&d_rgb,rgbBytes);
     cudaMalloc(&d_gray, grayBytes);
     cudaMalloc(&d_blur, grayBytes);
     cudaMalloc(&d_edges,grayBytes);
-    cudaMalloc(&d_gx ,   floatBytes);
-    cudaMalloc(&d_gy ,   floatBytes);
-    cudaMalloc(&d_mag,   floatBytes);
-    cudaMalloc(&d_dir,   floatBytes);
+    cudaMalloc(&d_gx,floatBytes);
+    cudaMalloc(&d_gy,floatBytes);
+    cudaMalloc(&d_mag,floatBytes);
+    cudaMalloc(&d_dir,floatBytes);
 
     dim3 blockDim(16,16);
     dim3 gridDim((width+15)/16,(height+15)/16);
@@ -680,6 +680,55 @@ int main(int argc, char **argv)
         uint64_t t1=clock_now();
         printf("Total cycles (all ranks finished): %lu\n", t1 - t0);
     }
+
+    /* ==============================================================
+    ==  MPI-IO: append all images to one binary file (results.bin)
+    ==  Layout:
+    ==  int32  width,  int32 height,  int32 nImages
+    ==  then  nImages × (width*height) bytes, in image-index order
+    ============================================================== */
+
+    MPI_File fh;
+    MPI_Status mpistatus;
+    const char *binName = "results.bin";
+
+    MPI_File_open(MPI_COMM_WORLD, binName,
+                    MPI_MODE_CREATE | MPI_MODE_WRONLY,
+                    MPI_INFO_NULL, &fh);
+
+    /* --- header (only rank 0 writes once) ------------------------ */
+    if (rank == 0) {
+        int hdr[3] = { width, height, totalImages };
+        MPI_File_write(fh, hdr, 3, MPI_INT, &mpistatus);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);             /* make sure header done */
+
+    /* --- compute my global first-image index --------------------- */
+    int myFirstIdx = rank * baseJobs + (rank < remainder ? rank : remainder);
+    /* bytes per image                                             */
+    MPI_Offset imgBytes   = (MPI_Offset)width * height;
+    MPI_Offset headerSize = 3 * sizeof(int);
+
+    /* --- host buffer once per image ------------------------------ */
+    unsigned char *hostEdge = (unsigned char*)malloc(imgBytes);
+
+    for (int j = 0; j < myJobs; ++j) {
+
+        /* copy current edge map (d_edges already holds job j) */
+        cudaMemcpy(hostEdge, d_edges, imgBytes, cudaMemcpyDeviceToHost);
+
+        /* file offset for this image */
+        MPI_Offset offset = headerSize + (MPI_Offset)(myFirstIdx + j) * imgBytes;
+
+        /* write synchronously (independent) */
+        MPI_File_write_at(fh, offset,
+                            hostEdge, imgBytes,
+                            MPI_UNSIGNED_CHAR, &mpistatus);
+    }
+    free(hostEdge);
+    MPI_File_close(&fh);
+    if (rank==0) printf("All ranks: wrote %s with %d images\n", binName,totalImages);
+   
 
     //--------------------------------------------------------------------
     // Cleanup -----------------------------------------------------------
